@@ -1,0 +1,16 @@
+{
+  "pluginAlias": "HuumHeater",
+  "pluginType": "platform",
+  "singular": true,
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": { "title": "Name", "type": "string", "default": "Sauna" },
+      "username": { "title": "HUUM username", "type": "string", "required": true },
+      "password": { "title": "HUUM password", "type": "string", "required": true },
+      "defaultTemperature": { "title": "Default target (°C)", "type": "integer", "default": 80, "minimum": 40, "maximum": 110 },
+      "pollInterval": { "title": "Poll interval (s)", "type": "integer", "default": 30, "minimum": 10 },
+      "temperatureUnit": { "title": "Display unit", "type": "string", "enum": ["C", "F"], "default": "F" }
+    }
+  }
+}
