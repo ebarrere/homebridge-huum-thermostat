@@ -1,6 +1,8 @@
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
+const http = require('http');
 const path = require('path');
 
 // HUUM sauna as a heat-only Thermostat. API contract: https://github.com/frwickst/pyhuum
@@ -17,7 +19,20 @@ const STATUS = {
   400: 'emergency stop',
 };
 
+const MAX_SCHEDULE_AHEAD = 7 * 24 * 3600e3;
+// A start missed by more than this (e.g. Homebridge was down) is dropped, not run late.
+const SCHEDULE_GRACE = 15 * 60e3;
+
 const clamp = (t) => Math.round(Math.min(MAX_TEMP, Math.max(MIN_TEMP, t)));
+
+// Format an ISO 8601 time in its own UTC offset, so replies match the caller's clock.
+function spoken(iso) {
+  const m = /([+-])(\d\d):?(\d\d)$/.exec(iso);
+  const offset = m ? (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])) : 0;
+  const local = new Date(Date.parse(iso) + offset * 60e3);
+  const fmt = (o) => local.toLocaleString('en-US', { timeZone: 'UTC', ...o });
+  return `on ${fmt({ weekday: 'long' })} at ${fmt({ hour: 'numeric', minute: '2-digit' })}`;
+}
 
 // iOS names service tiles (and Siri targets) from ConfiguredName, not Name.
 function named(service, name, C) {
@@ -69,6 +84,7 @@ class Sauna {
       saved = JSON.parse(fs.readFileSync(this.stateFile, 'utf8'));
     } catch {}
     this.savedTarget = clamp(saved.target ?? config.defaultTemperature ?? 80);
+    this.schedule = saved.schedule ?? null; // { at: ISO 8601 string }
 
     accessory.getService(Service.AccessoryInformation)
       .setCharacteristic(C.Manufacturer, 'HUUM')
@@ -107,8 +123,17 @@ class Sauna {
     this.door.getCharacteristic(C.ContactSensorState)
       .onGet(() => this.doorState());
 
+    if (config.scheduleToken) this.serve(config.scheduleToken, config.schedulePort || 8582);
     this.poll();
     setInterval(() => this.poll(), Math.max(10, config.pollInterval || 30) * 1000);
+  }
+
+  save() {
+    try {
+      fs.writeFileSync(this.stateFile, JSON.stringify({ target: this.savedTarget, schedule: this.schedule }));
+    } catch (e) {
+      this.log.warn(`saving state: ${e.message}`);
+    }
   }
 
   // --- HomeKit getters: serve the last polled status, never block on the API.
@@ -167,11 +192,7 @@ class Sauna {
 
   async setTarget(value) {
     this.savedTarget = clamp(value);
-    try {
-      fs.writeFileSync(this.stateFile, JSON.stringify({ target: this.savedTarget }));
-    } catch (e) {
-      this.log.warn(`saving target: ${e.message}`);
-    }
+    this.save();
     if (this.status?.statusCode === 231) {
       await this.command('start', { targetTemperature: this.savedTarget });
     }
@@ -204,7 +225,72 @@ class Sauna {
       this.update(await this.request('GET', 'status'));
     } catch (e) {
       this.log.warn(`status: ${e.message}`);
+      return;
     }
+    if (this.schedule && Date.now() >= Date.parse(this.schedule.at)) await this.runSchedule();
+  }
+
+  // --- Scheduled start (HomeKit has no voice scheduling; see README).
+
+  async runSchedule() {
+    const { at } = this.schedule;
+    this.schedule = null;
+    this.save();
+    if (Date.now() - Date.parse(at) > SCHEDULE_GRACE) {
+      this.log.warn(`skipped scheduled start for ${at}: missed by more than 15 minutes`);
+      return;
+    }
+    this.log.info(`scheduled start for ${at}`);
+    try {
+      await this.setTargetMode(this.C.TargetHeatingCoolingState.HEAT);
+    } catch {
+      this.log.error(`scheduled start for ${at} failed (sauna ${STATUS[this.status?.statusCode] || 'unreachable'})`);
+    }
+  }
+
+  scheduleMessage() {
+    return this.schedule
+      ? `The sauna will start heating ${spoken(this.schedule.at)}.`
+      : 'No sauna start is scheduled.';
+  }
+
+  serve(token, port) {
+    const expected = Buffer.from(`Bearer ${token}`);
+    const authorized = (h = '') => h.length === expected.length && crypto.timingSafeEqual(Buffer.from(h), expected);
+    http.createServer(async (req, res) => {
+      const reply = (code, message) => {
+        res.writeHead(code, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ scheduled: this.schedule?.at ?? null, message }));
+      };
+      if (!req.url.split('?')[0].endsWith('/schedule')) return reply(404, 'Not found.');
+      if (!authorized(req.headers.authorization)) return reply(401, 'Unauthorized.');
+      if (req.method === 'GET') return reply(200, this.scheduleMessage());
+      if (req.method === 'DELETE') {
+        this.schedule = null;
+        this.save();
+        this.log.info('scheduled start cancelled');
+        return reply(200, 'Cancelled the scheduled sauna start.');
+      }
+      if (req.method !== 'POST') return reply(405, 'Method not allowed.');
+
+      let at;
+      try {
+        let body = '';
+        for await (const chunk of req) body += chunk;
+        at = String(JSON.parse(body).at);
+      } catch {
+        return reply(400, 'Expected JSON like {"at": "2026-11-06T18:00:00-07:00"}.');
+      }
+      const when = Date.parse(at);
+      if (Number.isNaN(when)) return reply(400, `I couldn't read the time "${at}".`);
+      if (when < Date.now() - 60e3) return reply(400, `That time (${spoken(at)}) is in the past.`);
+      if (when > Date.now() + MAX_SCHEDULE_AHEAD) return reply(400, 'I can only schedule up to a week ahead.');
+      this.schedule = { at };
+      this.save();
+      this.log.info(`start scheduled for ${at}`);
+      reply(200, this.scheduleMessage());
+    }).on('error', (e) => this.log.error(`schedule API: ${e.message}`))
+      .listen(port, () => this.log.info(`schedule API listening on :${port}`));
   }
 
   update(status) {

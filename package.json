@@ -1,7 +1,7 @@
 {
   "name": "homebridge-huum-thermostat",
   "displayName": "HUUM Sauna Thermostat",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "HUUM sauna heater (UKU Wi-Fi) as a heat-only HomeKit thermostat, with door sensor and Siri support",
   "main": "index.js",
   "license": "MIT",
